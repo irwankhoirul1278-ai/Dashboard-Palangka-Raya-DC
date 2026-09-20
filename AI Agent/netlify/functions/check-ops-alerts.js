@@ -1,23 +1,25 @@
 /**
  * netlify/functions/check-ops-alerts.js
  * ------------------------------------------------------------------
- * Scheduled Function (jalan tiap 1 JAM, jadwal di netlify.toml).
+ * Scheduled Function (jalan tiap 15 MENIT, jadwal di netlify.toml).
  * Ngecek 2 kondisi operasional:
  *
  *   1. Late Arrival numpuk hari ini (Inbound) — alert SEKALI per hari,
  *      begitu jumlahnya nembus LATE_ARRIVAL_ALERT_THRESHOLD. Reset
  *      otomatis kalau angkanya turun lagi di bawah ambang batas
- *      (misal ada koreksi data). Karena file ini sekarang jalan tiap
- *      1 jam (bukan 15 menit lagi), deteksi Late Arrival paling
- *      lambat 1 jam ketinggalan dari kejadian aslinya.
- *   2. Operator istirahat >60 menit (Rest Time) — REMINDER ULANG
- *      tiap kali function ini jalan (tiap 1 jam) selama operatornya
- *      masih tercatat istirahat >60 menit. Gak ada dedup harian lagi
- *      di sini — frekuensi reminder-nya murni ngikutin jadwal cron
- *      di netlify.toml.
+ *      (misal ada koreksi data).
+ *   2. Operator istirahat >60 menit (Rest Time) — alert SEKALI per
+ *      "episode" break-out (dedup by opsId + jamBreakOut, disimpen di
+ *      Firebase prDcMonitoring/restAlertState). Begitu operatornya
+ *      balik kerja (gak overtime lagi), flag-nya di-reset otomatis,
+ *      jadi kalau dia break lagi nanti dan overtime lagi, bakal
+ *      ke-alert lagi sebagai episode baru. TIDAK ada reminder ulang
+ *      selama masih di episode overtime yang sama — cukup 1x alert
+ *      per kejadian, biar grup gak kebanjiran list yang sama tiap 15
+ *      menit.
  *
- * State notifikasi Late Arrival disimpen di Firebase (bukan di memory
- * function, karena tiap invocation Netlify Function itu proses baru).
+ * State notifikasi disimpen di Firebase (bukan di memory function,
+ * karena tiap invocation Netlify Function itu proses baru).
  */
 
 const {
@@ -60,20 +62,52 @@ async function checkLateArrival(groupId, token) {
   }
 }
 
+// Dedup per opsId + jamBreakOut. Kalau opsId yang sama masih di jamBreakOut
+// yang sama persis dengan yang udah dinotif -> skip (masih episode yang
+// sama). Kalau jamBreakOut beda (break baru) atau belum pernah dinotif ->
+// dianggap "baru", alert.
 async function checkRestOvertime(groupId, token) {
   const data = await getRestAssetData();
   const status = computeRestAssetLiveStatus(data.logs, data.assetLogs, data.master, data.stationMap);
 
-  if (!status.operatorIstirahatLebih60Menit.length) return;
+  const stateRef = db().ref("prDcMonitoring/restAlertState");
+  const stateSnap = await stateRef.get();
+  const state = stateSnap.val() || {};
 
-  // Reminder ulang tiap run (tiap 1 jam) buat SEMUA operator yang masih
-  // kena kondisi ini — sengaja TANPA dedup, karena requirement-nya emang
-  // mau di-reminder terus selama masih berlangsung.
-  const lines = status.operatorIstirahatLebih60Menit.map(
-    (o) => `• ${o.nama} (${o.opsId}, ${o.agency}) - udah ${o.durasiMenit} menit sejak ${o.jamBreakOut}`
-  );
-  const text = `⏳ REMINDER: Operator Masih Istirahat >60 Menit - SOC\n${lines.join("\n")}\nCek Rest Time Monitoring ya.`;
-  await sendSeatalkGroupMessage(token, groupId, text);
+  const currentOpsIds = new Set(status.operatorIstirahatLebih60Menit.map((o) => o.opsId));
+
+  const newlyOver = status.operatorIstirahatLebih60Menit.filter((o) => {
+    const s = state[o.opsId];
+    return !(s && s.notified === true && s.jamBreakOut === o.jamBreakOut);
+  });
+
+  const updates = {};
+
+  // Reset flag buat opsId yang sebelumnya kena alert tapi sekarang udah
+  // gak overtime lagi (balik kerja) -> episode berikutnya bisa ke-alert lagi.
+  Object.keys(state).forEach((opsId) => {
+    if (state[opsId].notified === true && !currentOpsIds.has(opsId)) {
+      updates[`prDcMonitoring/restAlertState/${opsId}/notified`] = false;
+    }
+  });
+
+  if (newlyOver.length) {
+    const lines = newlyOver.map(
+      (o) => `• ${o.nama} (${o.opsId}, ${o.agency}) - udah ${o.durasiMenit} menit sejak ${o.jamBreakOut}`
+    );
+    const text = `⏳ ALERT: Operator Baru Kena Istirahat >60 Menit - SOC\n${lines.join("\n")}\nCek Rest Time Monitoring ya.`;
+    await sendSeatalkGroupMessage(token, groupId, text);
+    newlyOver.forEach((o) => {
+      updates[`prDcMonitoring/restAlertState/${o.opsId}`] = {
+        notified: true,
+        jamBreakOut: o.jamBreakOut,
+      };
+    });
+  }
+
+  if (Object.keys(updates).length) {
+    await db().ref().update(updates);
+  }
 }
 
 exports.handler = async () => {
