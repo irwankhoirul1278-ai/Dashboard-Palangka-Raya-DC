@@ -10,13 +10,16 @@
  *      (misal ada koreksi data).
  *   2. Operator istirahat >60 menit (Rest Time) — alert SEKALI per
  *      "episode" break-out (dedup by opsId + jamBreakOut, disimpen di
- *      Firebase prDcMonitoring/restAlertState). Begitu operatornya
- *      balik kerja (gak overtime lagi), flag-nya di-reset otomatis,
- *      jadi kalau dia break lagi nanti dan overtime lagi, bakal
- *      ke-alert lagi sebagai episode baru. TIDAK ada reminder ulang
- *      selama masih di episode overtime yang sama — cukup 1x alert
- *      per kejadian, biar grup gak kebanjiran list yang sama tiap 15
- *      menit.
+ *      Firebase prDcMonitoring/restAlertState). HANYA buat Break Out
+ *      yang kejadian HARI INI — log lama (kemarin/lebih) yang gak
+ *      sempet ke-"Break In" (data nyangkut) sengaja DIABAIKAN di sini,
+ *      biar alert gak numpuk sama history basi. Getter data-nya sendiri
+ *      (getRestAssetData) tetep narik window 3 hari, karena dipakai
+ *      juga sama chatbot buat jawab pertanyaan manual — filter "hari
+ *      ini" cuma diterapin di alert otomatis ini.
+ *      Begitu operatornya balik kerja (gak overtime lagi), flag-nya
+ *      di-reset otomatis, jadi kalau dia break lagi nanti dan overtime
+ *      lagi, bakal ke-alert lagi sebagai episode baru.
  *
  * State notifikasi disimpen di Firebase (bukan di memory function,
  * karena tiap invocation Netlify Function itu proses baru).
@@ -65,18 +68,23 @@ async function checkLateArrival(groupId, token) {
 // Dedup per opsId + jamBreakOut. Kalau opsId yang sama masih di jamBreakOut
 // yang sama persis dengan yang udah dinotif -> skip (masih episode yang
 // sama). Kalau jamBreakOut beda (break baru) atau belum pernah dinotif ->
-// dianggap "baru", alert.
+// dianggap "baru", alert. HANYA operator yang jamBreakOut-nya HARI INI.
 async function checkRestOvertime(groupId, token) {
   const data = await getRestAssetData();
   const status = computeRestAssetLiveStatus(data.logs, data.assetLogs, data.master, data.stationMap);
+
+  const today = todayStr();
+  const overtimeToday = status.operatorIstirahatLebih60Menit.filter(
+    (o) => o.jamBreakOut && o.jamBreakOut.slice(0, 10) === today
+  );
 
   const stateRef = db().ref("prDcMonitoring/restAlertState");
   const stateSnap = await stateRef.get();
   const state = stateSnap.val() || {};
 
-  const currentOpsIds = new Set(status.operatorIstirahatLebih60Menit.map((o) => o.opsId));
+  const currentOpsIds = new Set(overtimeToday.map((o) => o.opsId));
 
-  const newlyOver = status.operatorIstirahatLebih60Menit.filter((o) => {
+  const newlyOver = overtimeToday.filter((o) => {
     const s = state[o.opsId];
     return !(s && s.notified === true && s.jamBreakOut === o.jamBreakOut);
   });
@@ -84,7 +92,8 @@ async function checkRestOvertime(groupId, token) {
   const updates = {};
 
   // Reset flag buat opsId yang sebelumnya kena alert tapi sekarang udah
-  // gak overtime lagi (balik kerja) -> episode berikutnya bisa ke-alert lagi.
+  // gak overtime lagi HARI INI (balik kerja, atau log-nya udah basi dari
+  // hari kemarin) -> episode berikutnya bisa ke-alert lagi.
   Object.keys(state).forEach((opsId) => {
     if (state[opsId].notified === true && !currentOpsIds.has(opsId)) {
       updates[`prDcMonitoring/restAlertState/${opsId}/notified`] = false;
