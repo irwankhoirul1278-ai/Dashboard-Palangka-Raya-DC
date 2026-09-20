@@ -38,7 +38,27 @@ function getFirebaseApp() {
   if (!raw) {
     throw new Error("Env var FIREBASE_SERVICE_ACCOUNT_JSON belum diset.");
   }
-  const serviceAccount = JSON.parse(raw);
+
+  let serviceAccount;
+  try {
+    serviceAccount = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(
+      "FIREBASE_SERVICE_ACCOUNT_JSON bukan JSON yang valid (cek lagi isinya di Netlify env var): " + err.message
+    );
+  }
+
+  // Penyebab paling umum init Firebase Admin gagal: private_key di dalam
+  // JSON itu harusnya punya newline BENERAN, tapi pas disave lewat env var
+  // UI kadang malah kesimpen sebagai teks literal "\n" (backslash-n).
+  // Jaga-jaga convert balik di sini.
+  if (serviceAccount.private_key && serviceAccount.private_key.includes("\\n")) {
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+  }
+
+  if (!process.env.FIREBASE_DATABASE_URL) {
+    throw new Error("Env var FIREBASE_DATABASE_URL belum diset.");
+  }
 
   return admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -407,12 +427,95 @@ async function answerPerformanceBaggerQuestion(text) {
   return lines.join("\n");
 }
 
+// ================= PENCARIAN ASSET SPESIFIK (nama item / nama pemegang) =================
+// Handler "penyelamat" - dipanggil PALING TERAKHIR di router, cuma jalan
+// kalau semua handler keyword-based di atas gak nyantol. Nyoba cocokin teks
+// user ke nama Asset di Stock (buat "<nama item> sisa berapa?" tanpa perlu
+// nyebut kata "stock"), ATAU ke nama orang di master data Rest Time (buat
+// "Serial Number yang dipegang <nama orang>?").
+
+function normalizeForMatch(str) {
+  return String(str || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Berapa persen kata di targetName yang muncul di teks user. Ambang 0.6
+// dipilih biar toleran typo/singkatan dikit tapi gak asal nyantol ke item
+// yang cuma mirip sepintas.
+function nameMatchScore(targetName, textWordsSet) {
+  const words = normalizeForMatch(targetName).split(" ").filter((w) => w.length >= 3);
+  if (!words.length) return 0;
+  const hit = words.filter((w) => textWordsSet.has(w)).length;
+  return hit / words.length;
+}
+
+async function answerAssetSearchQuestion(text) {
+  const textWords = new Set(normalizeForMatch(text).split(" ").filter((w) => w.length >= 3));
+  if (!textWords.size) return null;
+
+  // --- 1) Coba cocokin ke nama Asset di Stock (Inventory Control) ---
+  try {
+    const items = await getStockItems();
+    let bestMatch = null;
+    let bestScore = 0;
+    for (const it of items) {
+      const score = nameMatchScore(it.name, textWords);
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = it;
+      }
+    }
+    if (bestMatch && bestScore >= 0.6) {
+      return `📦 ${bestMatch.name}: sisa ${bestMatch.qty} ${bestMatch.unit || "pcs"} (Min: ${bestMatch.minStock ?? "-"})`;
+    }
+  } catch (err) {
+    console.error("Gagal cari Asset by nama di Stock:", err);
+  }
+
+  // --- 2) Coba cocokin ke nama orang (cari PDA/Asset yang lagi dipegang) ---
+  try {
+    const data = await getRestAssetData();
+    const master = data.master || {};
+    const nameMatches = Object.entries(master).filter(
+      ([, u]) => nameMatchScore(u.name, textWords) >= 0.6
+    );
+    if (!nameMatches.length) return null;
+
+    const status = computeRestAssetLiveStatus(data.logs, data.assetLogs, master, data.stationMap);
+    const opsIds = nameMatches.map(([opsId]) => opsId);
+    const heldByPerson = status.pdaBelumKembali.filter((p) => opsIds.includes(p.opsId));
+    const namaOrang = nameMatches.map(([, u]) => u.name).join(" / ");
+
+    if (!heldByPerson.length) {
+      return `${namaOrang} lagi gak pegang PDA/Asset apapun saat ini (belum ada log "Pinjam PDA" yang belum "Kembali").`;
+    }
+    const lines = heldByPerson.map(
+      (p) => `• ${p.station} - SN ${p.serialNumber} (dipinjam sejak ${p.jamPinjam}, ${p.durasiJam} jam)`
+    );
+    return `📱 Asset yang lagi dipegang ${namaOrang}:\n${lines.join("\n")}`;
+  } catch (err) {
+    console.error("Gagal cari Asset by nama pemegang:", err);
+  }
+
+  return null;
+}
+
 // ================= ROUTER LINTAS MODUL =================
 // Dipanggil dari seatalk-webhook.js. Urutan cek sengaja spesifik dulu
-// (Inbound/Rest Time/Bagger/Outbound) baru Inventory paling akhir, niru
-// pola routing keyword yang sama kayak Odyssey (report-agent.html) —
-// masing-masing handler return null kalau teksnya gak nyangkut ke
-// modulnya, jadi lanjut dicoba ke handler berikutnya.
+// (Inbound/Rest Time/Bagger/Outbound) baru Inventory, niru pola routing
+// keyword yang sama kayak Odyssey (report-agent.html) — masing-masing
+// handler return null kalau teksnya gak nyangkut ke modulnya, jadi lanjut
+// dicoba ke handler berikutnya. answerAssetSearchQuestion ditaruh PALING
+// AKHIR karena dia "nyoba semua kemungkinan" (nama item / nama orang),
+// jadi biar handler keyword yang lebih spesifik dapet kesempatan duluan.
+//
+// Router juga bedain 2 kasus "gak jawab": beneran gak ngerti (return null,
+// semua handler jalan normal tanpa error) vs ada handler yang ERROR pas
+// ambil data (misal Firebase gagal init) - biar seatalk-webhook.js bisa
+// kasih pesan yang jujur, bukan pura-pura "gak ngerti pertanyaan".
 async function answerModuleQuestion(text) {
   const handlers = [
     answerInboundQuestion,
@@ -420,14 +523,20 @@ async function answerModuleQuestion(text) {
     answerPerformanceBaggerQuestion,
     answerOutboundQuestion,
     answerInventoryQuestion,
+    answerAssetSearchQuestion,
   ];
+  let hadError = false;
   for (const handler of handlers) {
     try {
       const answer = await handler(text);
       if (answer) return answer;
     } catch (err) {
       console.error(`Gagal jalanin handler ${handler.name}:`, err);
+      hadError = true;
     }
+  }
+  if (hadError) {
+    return "Lagi ada gangguan ambil data dari salah satu modul dashboard (cek Netlify function log ya), coba lagi sebentar.";
   }
   return null;
 }
@@ -451,5 +560,6 @@ module.exports = {
   answerRestTimeQuestion,
   getTodayBaggerRecords,
   answerPerformanceBaggerQuestion,
+  answerAssetSearchQuestion,
   answerModuleQuestion,
 };
