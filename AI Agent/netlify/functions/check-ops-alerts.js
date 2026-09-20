@@ -1,19 +1,23 @@
 /**
  * netlify/functions/check-ops-alerts.js
  * ------------------------------------------------------------------
- * Scheduled Function (jalan tiap 15 menit, jadwal di netlify.toml —
- * disamain kayak check-low-stock.js). Ngecek 2 kondisi operasional:
+ * Scheduled Function (jalan tiap 1 JAM, jadwal di netlify.toml).
+ * Ngecek 2 kondisi operasional:
  *
  *   1. Late Arrival numpuk hari ini (Inbound) — alert SEKALI per hari,
  *      begitu jumlahnya nembus LATE_ARRIVAL_ALERT_THRESHOLD. Reset
  *      otomatis kalau angkanya turun lagi di bawah ambang batas
- *      (misal ada koreksi data).
- *   2. Operator istirahat >60 menit (Rest Time) — alert PER opsId per
- *      hari (gak spam ulang tiap 15 menit buat orang yang sama yang
- *      masih istirahat).
+ *      (misal ada koreksi data). Karena file ini sekarang jalan tiap
+ *      1 jam (bukan 15 menit lagi), deteksi Late Arrival paling
+ *      lambat 1 jam ketinggalan dari kejadian aslinya.
+ *   2. Operator istirahat >60 menit (Rest Time) — REMINDER ULANG
+ *      tiap kali function ini jalan (tiap 1 jam) selama operatornya
+ *      masih tercatat istirahat >60 menit. Gak ada dedup harian lagi
+ *      di sini — frekuensi reminder-nya murni ngikutin jadwal cron
+ *      di netlify.toml.
  *
- * State notifikasi disimpen di Firebase (bukan di memory function,
- * karena tiap invocation Netlify Function itu proses baru).
+ * State notifikasi Late Arrival disimpen di Firebase (bukan di memory
+ * function, karena tiap invocation Netlify Function itu proses baru).
  */
 
 const {
@@ -57,27 +61,19 @@ async function checkLateArrival(groupId, token) {
 }
 
 async function checkRestOvertime(groupId, token) {
-  const today = todayStr();
   const data = await getRestAssetData();
   const status = computeRestAssetLiveStatus(data.logs, data.assetLogs, data.master, data.stationMap);
 
-  const newlyAlerted = [];
-  for (const o of status.operatorIstirahatLebih60Menit) {
-    const flagRef = db().ref(`prDcMonitoring/overtimeAlertState/${today}/${o.opsId}`);
-    const snap = await flagRef.get();
-    if (!snap.val()) {
-      newlyAlerted.push(o);
-      await flagRef.set(true);
-    }
-  }
+  if (!status.operatorIstirahatLebih60Menit.length) return;
 
-  if (newlyAlerted.length) {
-    const lines = newlyAlerted.map(
-      (o) => `• ${o.nama} (${o.opsId}, ${o.agency}) - udah ${o.durasiMenit} menit sejak ${o.jamBreakOut}`
-    );
-    const text = `⏳ ALERT: Operator Istirahat >60 Menit - SOC\n${lines.join("\n")}\nCek Rest Time Monitoring ya.`;
-    await sendSeatalkGroupMessage(token, groupId, text);
-  }
+  // Reminder ulang tiap run (tiap 1 jam) buat SEMUA operator yang masih
+  // kena kondisi ini — sengaja TANPA dedup, karena requirement-nya emang
+  // mau di-reminder terus selama masih berlangsung.
+  const lines = status.operatorIstirahatLebih60Menit.map(
+    (o) => `• ${o.nama} (${o.opsId}, ${o.agency}) - udah ${o.durasiMenit} menit sejak ${o.jamBreakOut}`
+  );
+  const text = `⏳ REMINDER: Operator Masih Istirahat >60 Menit - SOC\n${lines.join("\n")}\nCek Rest Time Monitoring ya.`;
+  await sendSeatalkGroupMessage(token, groupId, text);
 }
 
 exports.handler = async () => {
