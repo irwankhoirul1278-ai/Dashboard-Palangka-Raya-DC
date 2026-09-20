@@ -271,6 +271,57 @@ async function getOutboundRows() {
   return fromColumnar(columnar);
 }
 
+// Bucket "D-Day" (belum aging / hari ini), "D-1".."D-5" (aging sekian
+// hari), "D-6+" (6 hari ke atas, gak dipecah lebih jauh lagi).
+function agingBucket(agingDays) {
+  const d = Number(agingDays);
+  const safe = Number.isFinite(d) && d > 0 ? d : 0;
+  if (safe === 0) return "D-Day";
+  if (safe >= 6) return "D-6+";
+  return `D-${safe}`;
+}
+
+const AGING_BUCKET_ORDER = ["D-Day", "D-1", "D-2", "D-3", "D-4", "D-5", "D-6+"];
+
+// Report lengkap: tiap bucket aging, breakdown qty (jumlah parcel) per Hub.
+// Dipakai sama check-aging-report.js (Scheduled Function tiap 1 jam).
+function formatAgingReport(rows) {
+  if (!rows.length) return null;
+
+  const grouped = {};
+  AGING_BUCKET_ORDER.forEach((b) => (grouped[b] = {}));
+  rows.forEach((r) => {
+    const bucket = agingBucket(r.agingDays);
+    const hub = r.hub || "(Hub tidak diketahui)";
+    grouped[bucket][hub] = (grouped[bucket][hub] || 0) + 1;
+  });
+
+  const lines = ["📦 Aging Days Report - Outbound", ""];
+  let totalAll = 0;
+  AGING_BUCKET_ORDER.forEach((bucket) => {
+    const hubEntries = Object.entries(grouped[bucket]).sort((a, b) => b[1] - a[1]);
+    const bucketTotal = hubEntries.reduce((sum, [, qty]) => sum + qty, 0);
+    if (!bucketTotal) return;
+    totalAll += bucketTotal;
+    lines.push(`${bucket}: ${bucketTotal} parcel`);
+    hubEntries.forEach(([hub, qty]) => lines.push(`  • ${hub}: ${qty}`));
+  });
+  lines.push("", `Total: ${totalAll} parcel`);
+  return lines.join("\n");
+}
+
+// Full listing Stock Consumable (bukan cuma yang menipis) - dipakai sama
+// daily-consumable-report.js (Scheduled Function jam 8 pagi WIB).
+function formatConsumableReport(items) {
+  const consumables = items.filter((it) => (it.category || "").toLowerCase().includes("consumable"));
+  if (!consumables.length) return "Gak ada Asset dengan kategori Consumable di Stock.";
+  const lines = consumables.map((it) => {
+    const menipis = Number(it.qty ?? 0) <= Number(it.minStock ?? 0) ? " ⚠️ MENIPIS" : "";
+    return `• ${it.name}: ${it.qty} ${it.unit || "pcs"}${menipis}`;
+  });
+  return `📋 Daily Report Stock Consumable - SOC\n${lines.join("\n")}`;
+}
+
 async function answerOutboundQuestion(text) {
   const lower = text.toLowerCase();
   if (!/aging|backlog|occupancy|staging/.test(lower)) return null;
@@ -554,6 +605,9 @@ module.exports = {
   computeTripStatus,
   answerInboundQuestion,
   getOutboundRows,
+  agingBucket,
+  formatAgingReport,
+  formatConsumableReport,
   answerOutboundQuestion,
   getRestAssetData,
   computeRestAssetLiveStatus,
