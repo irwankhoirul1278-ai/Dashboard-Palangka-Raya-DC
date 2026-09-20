@@ -1,6 +1,6 @@
 [build]
-  command = "npm install --prefix netlify/functions"
-  functions = "netlify/functions"
+  command = "npm install --prefix functions"
+  functions = "functions"
   publish = "."
 
 [functions."check-low-stock"]
